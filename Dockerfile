@@ -4,7 +4,7 @@ COPY go.mod ./
 COPY cmd ./cmd
 RUN go build -o /out/agent-tools ./cmd/agent-tools
 
-FROM alpine:3.20
+FROM node:22-alpine
 RUN apk add --no-cache bash ca-certificates git openssh-client patch
 COPY --from=build /out/agent-tools /usr/local/bin/agent-tools
 ENV AGENT_TOOLS_HOST=0.0.0.0 \
