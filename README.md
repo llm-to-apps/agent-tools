@@ -35,6 +35,9 @@ Configuration:
 - `APP_STARTUP_COMMANDS="npm run db:deploy && npm run db:seed"` optional commands to run before the app starts
 - `APP_STARTUP_TIMEOUT_SECONDS=120`
 - `APP_COMMAND="npm run start"`
+- `APP_AUTO_RESTART=true`
+- `APP_MAX_RESTARTS=5`
+- `APP_RESTART_BACKOFF_SECONDS=2`
 - `AGENT_APP_LOG=/tmp/agent-tools-app.log`
 
 ## Example

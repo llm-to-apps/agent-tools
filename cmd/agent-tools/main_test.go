@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSafePathRejectsEscapes(t *testing.T) {
@@ -266,6 +267,44 @@ func TestAppStatus(t *testing.T) {
 	}
 }
 
+func TestAppAutoRestartStopsAfterMaxAttempts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("app supervisor uses sh")
+	}
+
+	tmp := t.TempDir()
+	app := &appProcess{
+		command:           `count=$(cat count.txt 2>/dev/null || echo 0); count=$((count + 1)); echo "$count" > count.txt; exit 1`,
+		workdir:           tmp,
+		logPath:           filepath.Join(tmp, "app.log"),
+		maxRestarts:       2,
+		restartBackoff:    10 * time.Millisecond,
+		supervisorEnabled: true,
+	}
+
+	if err := app.start(); err != nil {
+		t.Fatalf("start returned error: %v", err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		status := app.status()
+		data, err := os.ReadFile(filepath.Join(tmp, "count.txt"))
+		return status["restartCount"] == 2 &&
+			status["running"] == false &&
+			status["lastExitError"] != "" &&
+			err == nil &&
+			strings.TrimSpace(string(data)) == "3"
+	})
+
+	data, err := os.ReadFile(filepath.Join(tmp, "count.txt"))
+	if err != nil {
+		t.Fatalf("read restart count fixture: %v", err)
+	}
+	if strings.TrimSpace(string(data)) != "3" {
+		t.Fatalf("expected initial start plus 2 restarts, got count %q", string(data))
+	}
+}
+
 func TestAuthMiddleware(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -371,6 +410,18 @@ func mustRun(t *testing.T, cwd, command string, args ...string) {
 	if result.ExitCode != 0 {
 		t.Fatalf("%s failed: stdout=%q stderr=%q", command, result.Stdout, result.Stderr)
 	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, check func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if check() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
 }
 
 func TestReadJSONRejectsInvalidJSON(t *testing.T) {

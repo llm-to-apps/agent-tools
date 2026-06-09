@@ -39,13 +39,20 @@ type commandResult struct {
 }
 
 type appProcess struct {
-	mu      sync.Mutex
-	command string
-	workdir string
-	logPath string
-	cmd     *exec.Cmd
-	done    chan error
-	started *time.Time
+	mu                sync.Mutex
+	command           string
+	workdir           string
+	logPath           string
+	cmd               *exec.Cmd
+	done              chan error
+	started           *time.Time
+	lastExit          *time.Time
+	lastExitError     string
+	restartCount      int
+	maxRestarts       int
+	restartBackoff    time.Duration
+	supervisorEnabled bool
+	stopping          bool
 }
 
 func main() {
@@ -58,9 +65,12 @@ func main() {
 	s := &server{
 		workdir: workdir,
 		app: &appProcess{
-			command: os.Getenv("APP_COMMAND"),
-			workdir: workdir,
-			logPath: logPath,
+			command:           os.Getenv("APP_COMMAND"),
+			workdir:           workdir,
+			logPath:           logPath,
+			maxRestarts:       envInt("APP_MAX_RESTARTS", 5),
+			restartBackoff:    envDurationSeconds("APP_RESTART_BACKOFF_SECONDS", 2),
+			supervisorEnabled: envBool("APP_AUTO_RESTART", true),
 		},
 	}
 
@@ -474,6 +484,10 @@ func (a *appProcess) setCommand(command string) {
 func (a *appProcess) start() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.startLocked(false)
+}
+
+func (a *appProcess) startLocked(autoRestart bool) error {
 	if a.cmd != nil && a.cmd.Process != nil && a.cmd.ProcessState == nil {
 		return errors.New("app is already running")
 	}
@@ -502,23 +516,67 @@ func (a *appProcess) start() error {
 	a.cmd = cmd
 	a.done = make(chan error, 1)
 	a.started = &now
+	a.stopping = false
+	if !autoRestart {
+		a.restartCount = 0
+		a.lastExit = nil
+		a.lastExitError = ""
+	}
 
 	go func() {
 		err := cmd.Wait()
 		a.done <- err
-		if err != nil {
-			log.Printf("app process exited: %v", err)
-		}
 		_ = logFile.Close()
+		a.handleExit(cmd, err)
 	}()
 
 	return nil
+}
+
+func (a *appProcess) handleExit(cmd *exec.Cmd, err error) {
+	a.mu.Lock()
+	if a.cmd != cmd {
+		a.mu.Unlock()
+		return
+	}
+	now := time.Now()
+	a.lastExit = &now
+	a.lastExitError = exitErrorString(err)
+	shouldRestart := a.supervisorEnabled && !a.stopping && strings.TrimSpace(a.command) != "" && a.restartCount < a.maxRestarts
+	if shouldRestart {
+		a.restartCount++
+	}
+	backoff := a.restartBackoff
+	a.mu.Unlock()
+
+	if err != nil {
+		log.Printf("app process exited: %v", err)
+	} else {
+		log.Printf("app process exited")
+	}
+
+	if !shouldRestart {
+		return
+	}
+
+	log.Printf("restarting app process, attempt %d/%d", a.restartCount, a.maxRestarts)
+	time.Sleep(backoff)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cmd != cmd || a.stopping {
+		return
+	}
+	if err := a.startLocked(true); err != nil {
+		log.Printf("failed to restart app process: %v", err)
+	}
 }
 
 func (a *appProcess) restart() error {
 	a.mu.Lock()
 	cmd := a.cmd
 	done := a.done
+	a.stopping = true
 	a.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil && cmd.ProcessState == nil {
@@ -536,7 +594,13 @@ func (a *appProcess) restart() error {
 			}
 		}
 	}
-	return a.start()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopping = false
+	a.restartCount = 0
+	a.lastExit = nil
+	a.lastExitError = ""
+	return a.startLocked(false)
 }
 
 func (a *appProcess) status() map[string]any {
@@ -552,12 +616,21 @@ func (a *appProcess) status() map[string]any {
 	if a.started != nil {
 		started = a.started.Format(time.RFC3339)
 	}
+	var lastExit any
+	if a.lastExit != nil {
+		lastExit = a.lastExit.Format(time.RFC3339)
+	}
 	return map[string]any{
-		"running": running,
-		"pid":     pid,
-		"command": a.command,
-		"started": started,
-		"logPath": a.logPath,
+		"running":           running,
+		"pid":               pid,
+		"command":           a.command,
+		"started":           started,
+		"lastExit":          lastExit,
+		"lastExitError":     a.lastExitError,
+		"restartCount":      a.restartCount,
+		"maxRestarts":       a.maxRestarts,
+		"supervisorEnabled": a.supervisorEnabled,
+		"logPath":           a.logPath,
 	}
 }
 
@@ -710,6 +783,22 @@ func env(key, fallback string) string {
 	return value
 }
 
+func envBool(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func envInt(key string, fallback int) int {
+	value := parseInt(os.Getenv(key), fallback)
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
 func parseInt(value string, fallback int) int {
 	if value == "" {
 		return fallback
@@ -723,6 +812,13 @@ func parseInt(value string, fallback int) int {
 
 func envDurationSeconds(key string, fallback int) time.Duration {
 	return time.Duration(parseInt(os.Getenv(key), fallback)) * time.Second
+}
+
+func exitErrorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func tailFile(path string, maxLines int) ([]string, error) {
