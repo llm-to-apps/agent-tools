@@ -29,6 +29,8 @@ Configuration:
 - `AGENT_TOOLS_HOST=0.0.0.0`
 - `AGENT_TOOLS_PORT=7070`
 - `AGENT_TOOLS_TOKEN=` optional bearer token for tool requests
+- `APP_STARTUP_COMMANDS="npm run db:deploy && npm run db:seed"` optional commands to run before the app starts
+- `APP_STARTUP_TIMEOUT_SECONDS=120`
 - `APP_COMMAND="npm run start"`
 - `AGENT_APP_LOG=/tmp/agent-tools-app.log`
 

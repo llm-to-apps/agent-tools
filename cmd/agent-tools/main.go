@@ -64,9 +64,9 @@ func main() {
 		},
 	}
 
-	if migrateCommand := os.Getenv("MIGRATE_COMMAND"); migrateCommand != "" {
-		if err := runLoggedCommand(workdir, migrateCommand, logPath, envDurationSeconds("MIGRATE_TIMEOUT_SECONDS", 120)); err != nil {
-			log.Printf("migration command failed: %v", err)
+	if startupCommands := os.Getenv("APP_STARTUP_COMMANDS"); startupCommands != "" {
+		if err := runLoggedCommand(workdir, startupCommands, logPath, envDurationSeconds("APP_STARTUP_TIMEOUT_SECONDS", 120)); err != nil {
+			log.Printf("startup command failed: %v", err)
 			os.Exit(1)
 		}
 	}
