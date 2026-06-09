@@ -238,6 +238,34 @@ func TestRunLoggedCommand(t *testing.T) {
 	}
 }
 
+func TestAppStatus(t *testing.T) {
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	s.app.setCommand("npm run dev")
+
+	req := httptest.NewRequest(http.MethodGet, "/app/status", nil)
+	rec := httptest.NewRecorder()
+	s.appStatus(rec, req)
+	assertStatus(t, rec, http.StatusOK)
+
+	var resp struct {
+		Running bool   `json:"running"`
+		Command string `json:"command"`
+		LogPath string `json:"logPath"`
+	}
+	decode(t, rec, &resp)
+
+	if resp.Running {
+		t.Fatal("expected app to be stopped")
+	}
+	if resp.Command != "npm run dev" {
+		t.Fatalf("unexpected app command: %q", resp.Command)
+	}
+	if resp.LogPath == "" {
+		t.Fatal("expected log path")
+	}
+}
+
 func TestAuthMiddleware(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

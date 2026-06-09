@@ -17,6 +17,7 @@ for coding agents:
 - `POST /git/commit`
 - `POST /app/start`
 - `POST /app/restart`
+- `GET /app/status`
 - `GET /app/logs?tail=200`
 
 ## Run

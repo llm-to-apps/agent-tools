@@ -90,6 +90,7 @@ func main() {
 	mux.HandleFunc("POST /git/commit", s.gitCommit)
 	mux.HandleFunc("POST /app/start", s.appStart)
 	mux.HandleFunc("POST /app/restart", s.appRestart)
+	mux.HandleFunc("GET /app/status", s.appStatus)
 	mux.HandleFunc("GET /app/logs", s.appLogs)
 
 	addr := host + ":" + port
@@ -441,6 +442,10 @@ func (s *server) appRestart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, s.app.status())
+}
+
+func (s *server) appStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.app.status())
 }
 
