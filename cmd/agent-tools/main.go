@@ -64,6 +64,13 @@ func main() {
 		},
 	}
 
+	if migrateCommand := os.Getenv("MIGRATE_COMMAND"); migrateCommand != "" {
+		if err := runLoggedCommand(workdir, migrateCommand, logPath, envDurationSeconds("MIGRATE_TIMEOUT_SECONDS", 120)); err != nil {
+			log.Printf("migration command failed: %v", err)
+			os.Exit(1)
+		}
+	}
+
 	if s.app.command != "" {
 		if err := s.app.start(); err != nil {
 			log.Printf("failed to start app command: %v", err)
@@ -539,6 +546,36 @@ func runCommand(cwd, command string, args []string, env map[string]string, stdin
 	}
 }
 
+func runLoggedCommand(cwd, command, logPath string, timeout time.Duration) error {
+	if strings.TrimSpace(command) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
+		return err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer logFile.Close()
+
+	fmt.Fprintf(logFile, "\n$ %s\n", command)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-lc", command)
+	cmd.Dir = cwd
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	err = cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("command timed out after %s", timeout)
+	}
+	return err
+}
+
 func readJSON(r *http.Request, target any) error {
 	defer r.Body.Close()
 	return json.NewDecoder(r.Body).Decode(target)
@@ -572,6 +609,10 @@ func parseInt(value string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func envDurationSeconds(key string, fallback int) time.Duration {
+	return time.Duration(parseInt(os.Getenv(key), fallback)) * time.Second
 }
 
 func tailFile(path string, maxLines int) ([]string, error) {

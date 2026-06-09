@@ -86,6 +86,36 @@ func TestShellRun(t *testing.T) {
 	}
 }
 
+func TestRunLoggedCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("logged command uses sh")
+	}
+
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "app.log")
+
+	err := runLoggedCommand(tmp, "printf migrated > migrated.txt", logPath, 5_000_000_000)
+	if err != nil {
+		t.Fatalf("runLoggedCommand returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmp, "migrated.txt"))
+	if err != nil {
+		t.Fatalf("expected command output file: %v", err)
+	}
+	if string(data) != "migrated" {
+		t.Fatalf("unexpected file content: %q", string(data))
+	}
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("expected log file: %v", err)
+	}
+	if !strings.Contains(string(logData), "$ printf migrated > migrated.txt") {
+		t.Fatalf("log does not include command: %q", string(logData))
+	}
+}
+
 func TestAuthMiddleware(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
