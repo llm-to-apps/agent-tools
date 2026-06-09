@@ -254,14 +254,18 @@ func (s *server) filesPatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("patch is required"))
 		return
 	}
-	result := runCommand(s.workdir, "git", []string{"apply", "--whitespace=nowarn", "-"}, nil, req.Patch, 30*time.Second)
+	result := runCommand(s.workdir, "git", []string{"apply", "--verbose", "--whitespace=nowarn", "-"}, nil, req.Patch, 30*time.Second)
 	if result.ExitCode != 0 {
 		fallback := runCommand(s.workdir, "patch", []string{"-p1"}, nil, req.Patch, 30*time.Second)
 		if fallback.ExitCode == 0 {
 			writeJSON(w, http.StatusOK, fallback)
 			return
 		}
-		writeJSON(w, http.StatusConflict, map[string]any{"gitApply": result, "patch": fallback})
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":    "patch could not be applied",
+			"gitApply": result,
+			"patch":    fallback,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

@@ -86,6 +86,58 @@ func TestShellRun(t *testing.T) {
 	}
 }
 
+func TestFilesPatchAppliesUnifiedDiff(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	if err := os.WriteFile(filepath.Join(tmp, "app.txt"), []byte("Money\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	body := `{"patch":"diff --git a/app.txt b/app.txt\n--- a/app.txt\n+++ b/app.txt\n@@ -1 +1 @@\n-Money\n+Marina\n"}`
+	req := httptest.NewRequest(http.MethodPost, "/files/patch", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.filesPatch(rec, req)
+	assertStatus(t, rec, http.StatusOK)
+
+	data, err := os.ReadFile(filepath.Join(tmp, "app.txt"))
+	if err != nil {
+		t.Fatalf("read patched file: %v", err)
+	}
+	if string(data) != "Marina\n" {
+		t.Fatalf("unexpected patched content: %q", string(data))
+	}
+}
+
+func TestFilesPatchReturnsConflictForInvalidPatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	if err := os.WriteFile(filepath.Join(tmp, "app.txt"), []byte("Money\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	body := `{"patch":"diff --git a/app.txt b/app.txt\n--- a/app.txt\n+++ b/app.txt\n@@ -1 +1 @@\n-Unknown\n+Marina\n"}`
+	req := httptest.NewRequest(http.MethodPost, "/files/patch", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.filesPatch(rec, req)
+	assertStatus(t, rec, http.StatusConflict)
+
+	data, err := os.ReadFile(filepath.Join(tmp, "app.txt"))
+	if err != nil {
+		t.Fatalf("read original file: %v", err)
+	}
+	if string(data) != "Money\n" {
+		t.Fatalf("invalid patch changed file: %q", string(data))
+	}
+}
+
 func TestRunLoggedCommand(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("logged command uses sh")
