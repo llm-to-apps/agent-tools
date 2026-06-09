@@ -49,10 +49,12 @@ func TestFilesWriteReadAndTree(t *testing.T) {
 	s.filesRead(readRec, readReq)
 	assertStatus(t, readRec, http.StatusOK)
 
-	var readResp map[string]string
+	var readResp struct {
+		Content string `json:"content"`
+	}
 	decode(t, readRec, &readResp)
-	if readResp["content"] != "hello tools" {
-		t.Fatalf("unexpected content: %q", readResp["content"])
+	if readResp.Content != "hello tools" {
+		t.Fatalf("unexpected content: %q", readResp.Content)
 	}
 
 	treeReq := httptest.NewRequest(http.MethodGet, "/files/tree?path=.&maxDepth=2", nil)
@@ -62,6 +64,74 @@ func TestFilesWriteReadAndTree(t *testing.T) {
 
 	if !strings.Contains(treeRec.Body.String(), "docs/hello.txt") {
 		t.Fatalf("tree response does not include written file: %s", treeRec.Body.String())
+	}
+}
+
+func TestFilesReadSupportsLineRange(t *testing.T) {
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	if err := os.WriteFile(filepath.Join(tmp, "app.txt"), []byte("one\ntwo\nthree\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/files/read?path=app.txt&startLine=2&endLine=3", nil)
+	rec := httptest.NewRecorder()
+	s.filesRead(rec, req)
+	assertStatus(t, rec, http.StatusOK)
+
+	var resp struct {
+		Content    string `json:"content"`
+		StartLine  int    `json:"startLine"`
+		EndLine    int    `json:"endLine"`
+		TotalLines int    `json:"totalLines"`
+	}
+	decode(t, rec, &resp)
+	if resp.Content != "two\nthree\n" || resp.StartLine != 2 || resp.EndLine != 3 || resp.TotalLines != 3 {
+		t.Fatalf("unexpected ranged read response: %+v", resp)
+	}
+}
+
+func TestFilesReplaceText(t *testing.T) {
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	if err := os.WriteFile(filepath.Join(tmp, "app.txt"), []byte("Money\nMoney\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	body := `{"path":"app.txt","search":"Money","replace":"Anton","expectedReplacements":2}`
+	req := httptest.NewRequest(http.MethodPost, "/files/replace-text", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.filesReplaceText(rec, req)
+	assertStatus(t, rec, http.StatusOK)
+
+	data, err := os.ReadFile(filepath.Join(tmp, "app.txt"))
+	if err != nil {
+		t.Fatalf("read replaced file: %v", err)
+	}
+	if string(data) != "Anton\nAnton\n" {
+		t.Fatalf("unexpected replaced content: %q", string(data))
+	}
+}
+
+func TestFilesReplaceTextReturnsConflictWhenExpectedCountDiffers(t *testing.T) {
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	if err := os.WriteFile(filepath.Join(tmp, "app.txt"), []byte("Money\nMoney\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	body := `{"path":"app.txt","search":"Money","replace":"Anton","expectedReplacements":1}`
+	req := httptest.NewRequest(http.MethodPost, "/files/replace-text", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.filesReplaceText(rec, req)
+	assertStatus(t, rec, http.StatusConflict)
+
+	data, err := os.ReadFile(filepath.Join(tmp, "app.txt"))
+	if err != nil {
+		t.Fatalf("read original file: %v", err)
+	}
+	if string(data) != "Money\nMoney\n" {
+		t.Fatalf("conflicting replace changed file: %q", string(data))
 	}
 }
 
@@ -209,6 +279,37 @@ func TestGitStatusInRepository(t *testing.T) {
 	}
 	if !strings.Contains(resp.Stdout, "No commits yet") && !strings.Contains(resp.Stdout, "main") && !strings.Contains(resp.Stdout, "master") {
 		t.Fatalf("unexpected git status output: %q", resp.Stdout)
+	}
+}
+
+func TestGitDiffInRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	tmp := t.TempDir()
+	mustRun(t, tmp, "git", "init")
+	mustRun(t, tmp, "git", "config", "user.email", "agent-tools@example.test")
+	mustRun(t, tmp, "git", "config", "user.name", "Agent Tools")
+	if err := os.WriteFile(filepath.Join(tmp, "app.txt"), []byte("Money\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	mustRun(t, tmp, "git", "add", "app.txt")
+	mustRun(t, tmp, "git", "commit", "-m", "initial")
+	if err := os.WriteFile(filepath.Join(tmp, "app.txt"), []byte("Anton\n"), 0644); err != nil {
+		t.Fatalf("write changed fixture: %v", err)
+	}
+
+	s := testServer(tmp)
+	req := httptest.NewRequest(http.MethodGet, "/git/diff", nil)
+	rec := httptest.NewRecorder()
+	s.gitDiff(rec, req)
+	assertStatus(t, rec, http.StatusOK)
+
+	var resp commandResult
+	decode(t, rec, &resp)
+	if resp.ExitCode != 0 || !strings.Contains(resp.Stdout, "-Money") || !strings.Contains(resp.Stdout, "+Anton") {
+		t.Fatalf("unexpected git diff result: %+v", resp)
 	}
 }
 

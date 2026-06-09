@@ -82,9 +82,11 @@ func main() {
 	mux.HandleFunc("GET /files/tree", s.filesTree)
 	mux.HandleFunc("GET /files/read", s.filesRead)
 	mux.HandleFunc("POST /files/write", s.filesWrite)
+	mux.HandleFunc("POST /files/replace-text", s.filesReplaceText)
 	mux.HandleFunc("POST /files/patch", s.filesPatch)
 	mux.HandleFunc("POST /shell/run", s.shellRun)
 	mux.HandleFunc("GET /git/status", s.gitStatus)
+	mux.HandleFunc("GET /git/diff", s.gitDiff)
 	mux.HandleFunc("POST /git/commit", s.gitCommit)
 	mux.HandleFunc("POST /app/start", s.appStart)
 	mux.HandleFunc("POST /app/restart", s.appRestart)
@@ -200,9 +202,19 @@ func (s *server) filesRead(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
+	startLine := parseInt(r.URL.Query().Get("startLine"), 0)
+	endLine := parseInt(r.URL.Query().Get("endLine"), 0)
+	content, actualStart, actualEnd, totalLines, err := sliceLines(string(data), startLine, endLine)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path":    s.rel(path),
-		"content": string(data),
+		"path":      s.rel(path),
+		"content":   content,
+		"startLine": actualStart,
+		"endLine":   actualEnd,
+		"totalLines": totalLines,
 	})
 }
 
@@ -240,6 +252,63 @@ func (s *server) filesWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"path": s.rel(path)})
+}
+
+func (s *server) filesReplaceText(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path                 string `json:"path"`
+		Search               string `json:"search"`
+		Replace              string `json:"replace"`
+		ExpectedReplacements int    `json:"expectedReplacements"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Search == "" {
+		writeError(w, http.StatusBadRequest, errors.New("search is required"))
+		return
+	}
+	path, err := s.safePath(req.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+
+	content := string(data)
+	replacements := strings.Count(content, req.Search)
+	if replacements == 0 {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":        "search text not found",
+			"path":         s.rel(path),
+			"replacements": 0,
+		})
+		return
+	}
+	if req.ExpectedReplacements > 0 && replacements != req.ExpectedReplacements {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":                 "replacement count did not match expectedReplacements",
+			"path":                  s.rel(path),
+			"replacements":          replacements,
+			"expectedReplacements":  req.ExpectedReplacements,
+		})
+		return
+	}
+
+	updated := strings.ReplaceAll(content, req.Search, req.Replace)
+	if err := os.WriteFile(path, []byte(updated), 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":         s.rel(path),
+		"replacements": replacements,
+	})
 }
 
 func (s *server) filesPatch(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +382,11 @@ func (s *server) shellRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) gitStatus(w http.ResponseWriter, r *http.Request) {
 	result := runCommand(s.workdir, "git", []string{"status", "--short", "--branch"}, nil, "", 30*time.Second)
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) gitDiff(w http.ResponseWriter, r *http.Request) {
+	result := runCommand(s.workdir, "git", []string{"diff", "--", "."}, nil, "", 30*time.Second)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -506,6 +580,33 @@ func (s *server) rel(path string) string {
 		return ""
 	}
 	return rel
+}
+
+func sliceLines(content string, startLine, endLine int) (string, int, int, int, error) {
+	lines := strings.SplitAfter(content, "\n")
+	if content == "" {
+		lines = []string{}
+	} else if strings.HasSuffix(content, "\n") && len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	} else if !strings.HasSuffix(content, "\n") && len(lines) > 0 {
+		lines[len(lines)-1] = strings.TrimSuffix(lines[len(lines)-1], "\n")
+	}
+
+	totalLines := len(lines)
+	if startLine == 0 && endLine == 0 {
+		return content, 1, totalLines, totalLines, nil
+	}
+	if startLine <= 0 {
+		startLine = 1
+	}
+	if endLine <= 0 || endLine > totalLines {
+		endLine = totalLines
+	}
+	if startLine > endLine || startLine > totalLines {
+		return "", 0, 0, totalLines, errors.New("line range is outside file")
+	}
+
+	return strings.Join(lines[startLine-1:endLine], ""), startLine, endLine, totalLines, nil
 }
 
 func runCommand(cwd, command string, args []string, env map[string]string, stdin string, timeout time.Duration) commandResult {

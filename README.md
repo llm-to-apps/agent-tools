@@ -7,11 +7,13 @@ for coding agents:
 
 - `GET /health`
 - `GET /files/tree?path=.&maxDepth=3`
-- `GET /files/read?path=README.md`
+- `GET /files/read?path=README.md&startLine=1&endLine=80`
 - `POST /files/write`
+- `POST /files/replace-text`
 - `POST /files/patch`
 - `POST /shell/run`
 - `GET /git/status`
+- `GET /git/diff`
 - `POST /git/commit`
 - `POST /app/start`
 - `POST /app/restart`
