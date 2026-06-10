@@ -486,7 +486,7 @@ func (s *server) gitSave(w http.ResponseWriter, r *http.Request) {
 			gitIdentityCommand(),
 			"git add -A",
 			fmt.Sprintf("git diff --cached --quiet || git commit -m %s", shellQuote(req.Message)),
-			fmt.Sprintf("git push || git push -u origin HEAD:%s", shellQuote(env("GIT_BRANCH", "main"))),
+			gitPushCommand(env("GIT_BRANCH", "main")),
 		}, " && ")},
 		nil,
 		"",
@@ -497,6 +497,13 @@ func (s *server) gitSave(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusBadRequest
 	}
 	writeJSON(w, status, result)
+}
+
+func gitPushCommand(branch string) string {
+	return fmt.Sprintf(
+		"if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then git push; else git push -u origin HEAD:%s; fi",
+		shellQuote(branch),
+	)
 }
 
 func ensureGitIdentity(workdir string) commandResult {

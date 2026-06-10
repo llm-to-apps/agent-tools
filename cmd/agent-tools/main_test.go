@@ -411,6 +411,9 @@ func TestGitSaveCommitsAndPushes(t *testing.T) {
 	if resp.ExitCode != 0 {
 		t.Fatalf("git save failed: %+v", resp)
 	}
+	if strings.Contains(resp.Stderr, "has no upstream branch") {
+		t.Fatalf("git save should set upstream without a failed push first: %+v", resp)
+	}
 
 	mustRun(t, tmp, "git", "clone", "--branch", "main", remote, clone)
 	data, err := os.ReadFile(filepath.Join(clone, "app.txt"))
