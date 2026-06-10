@@ -422,6 +422,97 @@ func TestGitSaveCommitsAndPushes(t *testing.T) {
 	}
 }
 
+func TestSyncGitWorkspaceCreatesLocalBaselineWithoutPush(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote.git")
+	workdir := filepath.Join(tmp, "work")
+
+	mustRun(t, tmp, "git", "init", "--bare", remote)
+	if err := os.MkdirAll(filepath.Join(workdir, "node_modules"), 0755); err != nil {
+		t.Fatalf("create fixture directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, ".gitignore"), []byte("node_modules\n"), 0644); err != nil {
+		t.Fatalf("write gitignore fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "app.txt"), []byte("Image\n"), 0644); err != nil {
+		t.Fatalf("write app fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "node_modules", "ignored.txt"), []byte("Ignored\n"), 0644); err != nil {
+		t.Fatalf("write ignored fixture: %v", err)
+	}
+
+	t.Setenv("GIT_REPO_URL", remote)
+	t.Setenv("GIT_BRANCH", "main")
+	if err := syncGitWorkspace(workdir, filepath.Join(tmp, "sync.log"), 30*time.Second); err != nil {
+		t.Fatalf("sync git workspace: %v", err)
+	}
+
+	refs := strings.TrimSpace(mustRunOutput(t, tmp, "git", "--git-dir", remote, "for-each-ref", "--format=%(refname)"))
+	if refs != "" {
+		t.Fatalf("expected startup sync not to push refs, got %q", refs)
+	}
+
+	mustRun(t, workdir, "git", "rev-parse", "--verify", "HEAD")
+	tracked := mustRunOutput(t, workdir, "git", "ls-files")
+	if !strings.Contains(tracked, ".gitignore") || !strings.Contains(tracked, "app.txt") {
+		t.Fatalf("expected baseline to track app files, got %q", tracked)
+	}
+	if strings.Contains(tracked, "node_modules/ignored.txt") {
+		t.Fatalf("expected baseline to ignore dependency artifacts, got %q", tracked)
+	}
+}
+
+func TestSyncGitWorkspaceRestoresExistingRemoteBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote.git")
+	seed := filepath.Join(tmp, "seed")
+	workdir := filepath.Join(tmp, "work")
+
+	mustRun(t, tmp, "git", "init", "--bare", remote)
+	if err := os.MkdirAll(seed, 0755); err != nil {
+		t.Fatalf("create seed repo: %v", err)
+	}
+	mustRun(t, seed, "git", "init", "-b", "main")
+	mustRun(t, seed, "git", "config", "user.email", "agent-tools@example.test")
+	mustRun(t, seed, "git", "config", "user.name", "Agent Tools")
+	if err := os.WriteFile(filepath.Join(seed, "app.txt"), []byte("Remote\n"), 0644); err != nil {
+		t.Fatalf("write seed fixture: %v", err)
+	}
+	mustRun(t, seed, "git", "add", "app.txt")
+	mustRun(t, seed, "git", "commit", "-m", "seed")
+	mustRun(t, seed, "git", "remote", "add", "origin", remote)
+	mustRun(t, seed, "git", "push", "-u", "origin", "main")
+
+	if err := os.MkdirAll(workdir, 0755); err != nil {
+		t.Fatalf("create workdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "app.txt"), []byte("Image\n"), 0644); err != nil {
+		t.Fatalf("write image fixture: %v", err)
+	}
+
+	t.Setenv("GIT_REPO_URL", remote)
+	t.Setenv("GIT_BRANCH", "main")
+	if err := syncGitWorkspace(workdir, filepath.Join(tmp, "sync.log"), 30*time.Second); err != nil {
+		t.Fatalf("sync git workspace: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(workdir, "app.txt"))
+	if err != nil {
+		t.Fatalf("read restored file: %v", err)
+	}
+	if string(data) != "Remote\n" {
+		t.Fatalf("expected remote content to be restored, got %q", string(data))
+	}
+}
+
 func testServer(workdir string) *server {
 	return &server{
 		workdir: workdir,
@@ -448,10 +539,16 @@ func decode(t *testing.T, rec *httptest.ResponseRecorder, target any) {
 
 func mustRun(t *testing.T, cwd, command string, args ...string) {
 	t.Helper()
+	_ = mustRunOutput(t, cwd, command, args...)
+}
+
+func mustRunOutput(t *testing.T, cwd, command string, args ...string) string {
+	t.Helper()
 	result := runCommand(cwd, command, args, nil, "", 30_000_000_000)
 	if result.ExitCode != 0 {
 		t.Fatalf("%s failed: stdout=%q stderr=%q", command, result.Stdout, result.Stderr)
 	}
+	return result.Stdout
 }
 
 func waitFor(t *testing.T, timeout time.Duration, check func() bool) {

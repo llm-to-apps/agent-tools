@@ -869,38 +869,45 @@ func syncGitWorkspace(workdir, logPath string, timeout time.Duration) error {
 		commands := []string{
 			fmt.Sprintf("git remote get-url origin >/dev/null 2>&1 && git remote set-url origin %s || git remote add origin %s", shellQuote(repoURL), shellQuote(repoURL)),
 			fmt.Sprintf("git checkout %s 2>/dev/null || git checkout -b %s", shellQuote(branch), shellQuote(branch)),
-			fmt.Sprintf("git pull --ff-only origin %s || true", shellQuote(branch)),
-			fmt.Sprintf("git push -u origin HEAD:%s", shellQuote(branch)),
+			gitIdentityCommand(),
+			fmt.Sprintf("if %s; then git pull --ff-only origin %s; fi", remoteBranchExistsCommand(repoURL, branch), shellQuote(branch)),
 		}
 
 		return runLoggedCommand(workdir, strings.Join(commands, " && "), logPath, timeout)
 	}
 
-	empty, err := isDirEmpty(workdir)
-	if err != nil {
-		return err
-	}
+	return runLoggedCommand(workdir, strings.Join([]string{
+		fmt.Sprintf("if %s; then %s; else %s; fi", remoteBranchExistsCommand(repoURL, branch), cloneIntoWorkdirCommand(repoURL, branch), localInitialCommitCommand(repoURL, branch)),
+	}, " && "), logPath, timeout)
+}
 
-	if empty {
-		return runLoggedCommand(
-			filepath.Dir(workdir),
-			fmt.Sprintf("git clone --branch %s %s %s || git clone %s %s", shellQuote(branch), shellQuote(repoURL), shellQuote(workdir), shellQuote(repoURL), shellQuote(workdir)),
-			logPath,
-			timeout,
-		)
-	}
+func remoteBranchExistsCommand(repoURL, branch string) string {
+	return fmt.Sprintf(
+		"git ls-remote --exit-code --heads %s %s >/dev/null 2>&1",
+		shellQuote(repoURL),
+		shellQuote(branch),
+	)
+}
 
-	commands := []string{
+func cloneIntoWorkdirCommand(repoURL, branch string) string {
+	return strings.Join([]string{
+		"tmp=\"$(mktemp -d)\"",
+		fmt.Sprintf("git clone --branch %s %s \"$tmp\"", shellQuote(branch), shellQuote(repoURL)),
+		"find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
+		"cp -a \"$tmp\"/. .",
+		"rm -rf \"$tmp\"",
+	}, " && ")
+}
+
+func localInitialCommitCommand(repoURL, branch string) string {
+	return strings.Join([]string{
 		fmt.Sprintf("git init -b %s", shellQuote(branch)),
 		fmt.Sprintf("git remote add origin %s", shellQuote(repoURL)),
 		fmt.Sprintf("git config user.email %s", shellQuote(env("GIT_AUTHOR_EMAIL", "agent-tools@example.local"))),
 		fmt.Sprintf("git config user.name %s", shellQuote(env("GIT_AUTHOR_NAME", "Agent Tools"))),
 		initialImportAddCommand(),
 		"git diff --cached --quiet || git commit -m 'Initial project import'",
-		fmt.Sprintf("git push -u origin HEAD:%s", shellQuote(branch)),
-	}
-
-	return runLoggedCommand(workdir, strings.Join(commands, " && "), logPath, timeout)
+	}, " && ")
 }
 
 func initialImportAddCommand() string {
@@ -912,18 +919,6 @@ func initialImportAddCommand() string {
 		"':!dist-worker'",
 		"':!*.log'",
 	}, " ")
-}
-
-func isDirEmpty(path string) (bool, error) {
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return true, nil
-		}
-		return false, err
-	}
-
-	return len(entries) == 0, nil
 }
 
 func shellQuote(value string) string {
