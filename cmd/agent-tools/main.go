@@ -877,7 +877,7 @@ func syncGitWorkspace(workdir, logPath string, timeout time.Duration) error {
 	}
 
 	return runLoggedCommand(workdir, strings.Join([]string{
-		fmt.Sprintf("if %s; then %s; else %s; fi", remoteBranchExistsCommand(repoURL, branch), cloneIntoWorkdirCommand(repoURL, branch), localInitialCommitCommand(repoURL, branch)),
+		fmt.Sprintf("if %s; then %s; else %s; fi", remoteBranchExistsCommand(repoURL, branch), restoreRemoteBranchCommand(repoURL, branch), localInitialCommitCommand(repoURL, branch)),
 	}, " && "), logPath, timeout)
 }
 
@@ -889,13 +889,16 @@ func remoteBranchExistsCommand(repoURL, branch string) string {
 	)
 }
 
-func cloneIntoWorkdirCommand(repoURL, branch string) string {
+func restoreRemoteBranchCommand(repoURL, branch string) string {
 	return strings.Join([]string{
 		"tmp=\"$(mktemp -d)\"",
+		"preserve=\"$(mktemp -d)\"",
 		fmt.Sprintf("git clone --branch %s %s \"$tmp\"", shellQuote(branch), shellQuote(repoURL)),
+		"if [ -d node_modules ]; then mv node_modules \"$preserve/node_modules\"; fi",
 		"find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
 		"cp -a \"$tmp\"/. .",
-		"rm -rf \"$tmp\"",
+		"if [ -d \"$preserve/node_modules\" ] && [ ! -e node_modules ]; then mv \"$preserve/node_modules\" node_modules; fi",
+		"rm -rf \"$tmp\" \"$preserve\"",
 	}, " && ")
 }
 

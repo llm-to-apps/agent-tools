@@ -494,8 +494,17 @@ func TestSyncGitWorkspaceRestoresExistingRemoteBranch(t *testing.T) {
 	if err := os.MkdirAll(workdir, 0755); err != nil {
 		t.Fatalf("create workdir: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(workdir, "node_modules", ".bin"), 0755); err != nil {
+		t.Fatalf("create dependency fixture: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(workdir, "app.txt"), []byte("Image\n"), 0644); err != nil {
 		t.Fatalf("write image fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "image-only.txt"), []byte("Stale\n"), 0644); err != nil {
+		t.Fatalf("write stale image fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "node_modules", ".bin", "next"), []byte("Next\n"), 0755); err != nil {
+		t.Fatalf("write dependency fixture: %v", err)
 	}
 
 	t.Setenv("GIT_REPO_URL", remote)
@@ -510,6 +519,12 @@ func TestSyncGitWorkspaceRestoresExistingRemoteBranch(t *testing.T) {
 	}
 	if string(data) != "Remote\n" {
 		t.Fatalf("expected remote content to be restored, got %q", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(workdir, "node_modules", ".bin", "next")); err != nil {
+		t.Fatalf("expected dependencies to be preserved: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, "image-only.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected stale image file to be removed, got err=%v", err)
 	}
 }
 
