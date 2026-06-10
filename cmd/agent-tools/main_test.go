@@ -414,7 +414,7 @@ func TestGitSaveCommitsAndPushes(t *testing.T) {
 		t.Fatalf("git save failed: %+v", resp)
 	}
 
-	mustRun(t, tmp, "git", "clone", remote, clone)
+	mustRun(t, tmp, "git", "clone", "--branch", "main", remote, clone)
 	data, err := os.ReadFile(filepath.Join(clone, "app.txt"))
 	if err != nil {
 		t.Fatalf("read pushed file: %v", err)
