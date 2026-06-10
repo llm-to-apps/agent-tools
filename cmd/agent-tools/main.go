@@ -74,26 +74,37 @@ func main() {
 		},
 	}
 
+	if os.Getenv("GIT_REPO_URL") != "" {
+		log.Printf("syncing git workspace")
+	}
 	if err := syncGitWorkspace(workdir, logPath, envDurationSeconds("GIT_SYNC_TIMEOUT_SECONDS", 120)); err != nil {
 		log.Printf("git workspace sync failed: %v", err)
 		os.Exit(1)
 	}
+	if os.Getenv("GIT_REPO_URL") != "" {
+		log.Printf("git workspace sync completed")
+	}
 
 	if restoreCommand := os.Getenv("APP_RESTORE_COMMAND"); restoreCommand != "" {
+		log.Printf("running restore command: %s", restoreCommand)
 		if err := runLoggedCommand(workdir, restoreCommand, logPath, envDurationSeconds("APP_RESTORE_TIMEOUT_SECONDS", 300)); err != nil {
 			log.Printf("restore command failed: %v", err)
 			os.Exit(1)
 		}
+		log.Printf("restore command completed")
 	}
 
 	if startupCommands := os.Getenv("APP_STARTUP_COMMANDS"); startupCommands != "" {
+		log.Printf("running startup commands: %s", startupCommands)
 		if err := runLoggedCommand(workdir, startupCommands, logPath, envDurationSeconds("APP_STARTUP_TIMEOUT_SECONDS", 120)); err != nil {
 			log.Printf("startup command failed: %v", err)
 			os.Exit(1)
 		}
+		log.Printf("startup commands completed")
 	}
 
 	if s.app.command != "" {
+		log.Printf("starting app command: %s", s.app.command)
 		if err := s.app.start(); err != nil {
 			log.Printf("failed to start app command: %v", err)
 		}
@@ -605,8 +616,8 @@ func (a *appProcess) startLocked(autoRestart bool) error {
 
 	cmd := exec.Command("sh", "-lc", a.command)
 	cmd.Dir = a.workdir
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	cmd.Stdout = io.MultiWriter(logFile, os.Stdout)
+	cmd.Stderr = io.MultiWriter(logFile, os.Stderr)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
@@ -844,18 +855,22 @@ func runLoggedCommand(cwd, command, logPath string, timeout time.Duration) error
 	defer logFile.Close()
 
 	fmt.Fprintf(logFile, "\n$ %s\n", command)
+	log.Printf("running command in %s: %s", cwd, command)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sh", "-lc", command)
 	cmd.Dir = cwd
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	cmd.Stdout = io.MultiWriter(logFile, os.Stdout)
+	cmd.Stderr = io.MultiWriter(logFile, os.Stderr)
 
 	err = cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("command timed out after %s", timeout)
+	}
+	if err == nil {
+		log.Printf("command completed: %s", command)
 	}
 	return err
 }
