@@ -74,6 +74,11 @@ func main() {
 		},
 	}
 
+	if err := syncGitWorkspace(workdir, logPath, envDurationSeconds("GIT_SYNC_TIMEOUT_SECONDS", 120)); err != nil {
+		log.Printf("git workspace sync failed: %v", err)
+		os.Exit(1)
+	}
+
 	if startupCommands := os.Getenv("APP_STARTUP_COMMANDS"); startupCommands != "" {
 		if err := runLoggedCommand(workdir, startupCommands, logPath, envDurationSeconds("APP_STARTUP_TIMEOUT_SECONDS", 120)); err != nil {
 			log.Printf("startup command failed: %v", err)
@@ -98,6 +103,11 @@ func main() {
 	mux.HandleFunc("GET /git/status", s.gitStatus)
 	mux.HandleFunc("GET /git/diff", s.gitDiff)
 	mux.HandleFunc("POST /git/commit", s.gitCommit)
+	mux.HandleFunc("POST /git/save", s.gitSave)
+	mux.HandleFunc("POST /git/pull", s.gitPull)
+	mux.HandleFunc("POST /git/push", s.gitPush)
+	mux.HandleFunc("POST /git/sync", s.gitSync)
+	mux.HandleFunc("GET /git/remote", s.gitRemote)
 	mux.HandleFunc("POST /app/start", s.appStart)
 	mux.HandleFunc("POST /app/restart", s.appRestart)
 	mux.HandleFunc("GET /app/status", s.appStatus)
@@ -221,10 +231,10 @@ func (s *server) filesRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path":      s.rel(path),
-		"content":   content,
-		"startLine": actualStart,
-		"endLine":   actualEnd,
+		"path":       s.rel(path),
+		"content":    content,
+		"startLine":  actualStart,
+		"endLine":    actualEnd,
 		"totalLines": totalLines,
 	})
 }
@@ -303,10 +313,10 @@ func (s *server) filesReplaceText(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ExpectedReplacements > 0 && replacements != req.ExpectedReplacements {
 		writeJSON(w, http.StatusConflict, map[string]any{
-			"error":                 "replacement count did not match expectedReplacements",
-			"path":                  s.rel(path),
-			"replacements":          replacements,
-			"expectedReplacements":  req.ExpectedReplacements,
+			"error":                "replacement count did not match expectedReplacements",
+			"path":                 s.rel(path),
+			"replacements":         replacements,
+			"expectedReplacements": req.ExpectedReplacements,
 		})
 		return
 	}
@@ -401,6 +411,11 @@ func (s *server) gitDiff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (s *server) gitRemote(w http.ResponseWriter, r *http.Request) {
+	result := runCommand(s.workdir, "git", []string{"remote", "-v"}, nil, "", 30*time.Second)
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (s *server) gitCommit(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Message string `json:"message"`
@@ -427,6 +442,66 @@ func (s *server) gitCommit(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusBadRequest
 	}
 	writeJSON(w, status, commit)
+}
+
+func (s *server) gitSave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Message string `json:"message"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("message is required"))
+		return
+	}
+
+	result := runCommand(
+		s.workdir,
+		"sh",
+		[]string{"-lc", strings.Join([]string{
+			"git add -A",
+			fmt.Sprintf("git diff --cached --quiet || git commit -m %s", shellQuote(req.Message)),
+			"git push",
+		}, " && ")},
+		nil,
+		"",
+		120*time.Second,
+	)
+	status := http.StatusOK
+	if result.ExitCode != 0 {
+		status = http.StatusBadRequest
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *server) gitPull(w http.ResponseWriter, r *http.Request) {
+	branch := env("GIT_BRANCH", "main")
+	result := runCommand(s.workdir, "git", []string{"pull", "--ff-only", "origin", branch}, nil, "", 120*time.Second)
+	status := http.StatusOK
+	if result.ExitCode != 0 {
+		status = http.StatusBadRequest
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *server) gitPush(w http.ResponseWriter, r *http.Request) {
+	result := runCommand(s.workdir, "git", []string{"push"}, nil, "", 120*time.Second)
+	status := http.StatusOK
+	if result.ExitCode != 0 {
+		status = http.StatusBadRequest
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *server) gitSync(w http.ResponseWriter, r *http.Request) {
+	if err := syncGitWorkspace(s.workdir, env("AGENT_APP_LOG", "/tmp/agent-tools-app.log"), envDurationSeconds("GIT_SYNC_TIMEOUT_SECONDS", 120)); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *server) appStart(w http.ResponseWriter, r *http.Request) {
@@ -757,6 +832,72 @@ func runLoggedCommand(cwd, command, logPath string, timeout time.Duration) error
 		return fmt.Errorf("command timed out after %s", timeout)
 	}
 	return err
+}
+
+func syncGitWorkspace(workdir, logPath string, timeout time.Duration) error {
+	repoURL := os.Getenv("GIT_REPO_URL")
+	if strings.TrimSpace(repoURL) == "" {
+		return nil
+	}
+
+	branch := env("GIT_BRANCH", "main")
+	if err := os.MkdirAll(workdir, 0755); err != nil {
+		return err
+	}
+
+	gitDir := filepath.Join(workdir, ".git")
+	if _, err := os.Stat(gitDir); err == nil {
+		commands := []string{
+			fmt.Sprintf("git remote get-url origin >/dev/null 2>&1 && git remote set-url origin %s || git remote add origin %s", shellQuote(repoURL), shellQuote(repoURL)),
+			fmt.Sprintf("git checkout %s 2>/dev/null || git checkout -b %s", shellQuote(branch), shellQuote(branch)),
+			fmt.Sprintf("git pull --ff-only origin %s || true", shellQuote(branch)),
+			fmt.Sprintf("git push -u origin HEAD:%s", shellQuote(branch)),
+		}
+
+		return runLoggedCommand(workdir, strings.Join(commands, " && "), logPath, timeout)
+	}
+
+	empty, err := isDirEmpty(workdir)
+	if err != nil {
+		return err
+	}
+
+	if empty {
+		return runLoggedCommand(
+			filepath.Dir(workdir),
+			fmt.Sprintf("git clone --branch %s %s %s || git clone %s %s", shellQuote(branch), shellQuote(repoURL), shellQuote(workdir), shellQuote(repoURL), shellQuote(workdir)),
+			logPath,
+			timeout,
+		)
+	}
+
+	commands := []string{
+		fmt.Sprintf("git init -b %s", shellQuote(branch)),
+		fmt.Sprintf("git remote add origin %s", shellQuote(repoURL)),
+		fmt.Sprintf("git config user.email %s", shellQuote(env("GIT_AUTHOR_EMAIL", "agent-tools@example.local"))),
+		fmt.Sprintf("git config user.name %s", shellQuote(env("GIT_AUTHOR_NAME", "Agent Tools"))),
+		"git add -A",
+		"git diff --cached --quiet || git commit -m 'Initial project import'",
+		fmt.Sprintf("git push -u origin HEAD:%s", shellQuote(branch)),
+	}
+
+	return runLoggedCommand(workdir, strings.Join(commands, " && "), logPath, timeout)
+}
+
+func isDirEmpty(path string) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+
+	return len(entries) == 0, nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func readJSON(r *http.Request, target any) error {

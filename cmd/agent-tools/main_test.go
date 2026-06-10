@@ -380,6 +380,50 @@ func TestGitDiffInRepository(t *testing.T) {
 	}
 }
 
+func TestGitSaveCommitsAndPushes(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote.git")
+	workdir := filepath.Join(tmp, "work")
+	clone := filepath.Join(tmp, "clone")
+
+	mustRun(t, tmp, "git", "init", "--bare", remote)
+	if err := os.MkdirAll(workdir, 0755); err != nil {
+		t.Fatalf("create workdir: %v", err)
+	}
+	mustRun(t, workdir, "git", "init", "-b", "main")
+	mustRun(t, workdir, "git", "config", "user.email", "agent-tools@example.test")
+	mustRun(t, workdir, "git", "config", "user.name", "Agent Tools")
+	mustRun(t, workdir, "git", "remote", "add", "origin", remote)
+	if err := os.WriteFile(filepath.Join(workdir, "app.txt"), []byte("Saved\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	s := testServer(workdir)
+	req := httptest.NewRequest(http.MethodPost, "/git/save", strings.NewReader(`{"message":"Save app changes"}`))
+	rec := httptest.NewRecorder()
+	s.gitSave(rec, req)
+	assertStatus(t, rec, http.StatusOK)
+
+	var resp commandResult
+	decode(t, rec, &resp)
+	if resp.ExitCode != 0 {
+		t.Fatalf("git save failed: %+v", resp)
+	}
+
+	mustRun(t, tmp, "git", "clone", remote, clone)
+	data, err := os.ReadFile(filepath.Join(clone, "app.txt"))
+	if err != nil {
+		t.Fatalf("read pushed file: %v", err)
+	}
+	if string(data) != "Saved\n" {
+		t.Fatalf("unexpected pushed content: %q", string(data))
+	}
+}
+
 func testServer(workdir string) *server {
 	return &server{
 		workdir: workdir,
