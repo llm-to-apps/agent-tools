@@ -463,7 +463,7 @@ func (s *server) gitSave(w http.ResponseWriter, r *http.Request) {
 		[]string{"-lc", strings.Join([]string{
 			"git add -A",
 			fmt.Sprintf("git diff --cached --quiet || git commit -m %s", shellQuote(req.Message)),
-			"git push",
+			fmt.Sprintf("git push || git push -u origin HEAD:%s", shellQuote(env("GIT_BRANCH", "main"))),
 		}, " && ")},
 		nil,
 		"",
