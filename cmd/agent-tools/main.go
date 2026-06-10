@@ -895,12 +895,23 @@ func syncGitWorkspace(workdir, logPath string, timeout time.Duration) error {
 		fmt.Sprintf("git remote add origin %s", shellQuote(repoURL)),
 		fmt.Sprintf("git config user.email %s", shellQuote(env("GIT_AUTHOR_EMAIL", "agent-tools@example.local"))),
 		fmt.Sprintf("git config user.name %s", shellQuote(env("GIT_AUTHOR_NAME", "Agent Tools"))),
-		"git add -A",
+		initialImportAddCommand(),
 		"git diff --cached --quiet || git commit -m 'Initial project import'",
 		fmt.Sprintf("git push -u origin HEAD:%s", shellQuote(branch)),
 	}
 
 	return runLoggedCommand(workdir, strings.Join(commands, " && "), logPath, timeout)
+}
+
+func initialImportAddCommand() string {
+	return strings.Join([]string{
+		"git add -A -- .",
+		"':!node_modules'",
+		"':!.next'",
+		"':!dist'",
+		"':!dist-worker'",
+		"':!*.log'",
+	}, " ")
 }
 
 func isDirEmpty(path string) (bool, error) {
