@@ -436,6 +436,10 @@ func (s *server) gitCommit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if result := ensureGitIdentity(s.workdir); result.ExitCode != 0 {
+		writeJSON(w, http.StatusBadRequest, result)
+		return
+	}
 	commit := runCommand(s.workdir, "git", []string{"commit", "-m", req.Message}, nil, "", 60*time.Second)
 	status := http.StatusOK
 	if commit.ExitCode != 0 {
@@ -461,6 +465,7 @@ func (s *server) gitSave(w http.ResponseWriter, r *http.Request) {
 		s.workdir,
 		"sh",
 		[]string{"-lc", strings.Join([]string{
+			gitIdentityCommand(),
 			"git add -A",
 			fmt.Sprintf("git diff --cached --quiet || git commit -m %s", shellQuote(req.Message)),
 			fmt.Sprintf("git push || git push -u origin HEAD:%s", shellQuote(env("GIT_BRANCH", "main"))),
@@ -474,6 +479,20 @@ func (s *server) gitSave(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusBadRequest
 	}
 	writeJSON(w, status, result)
+}
+
+func ensureGitIdentity(workdir string) commandResult {
+	return runCommand(workdir, "sh", []string{"-lc", gitIdentityCommand()}, nil, "", 30*time.Second)
+}
+
+func gitIdentityCommand() string {
+	email := shellQuote(env("GIT_AUTHOR_EMAIL", "agent-tools@example.local"))
+	name := shellQuote(env("GIT_AUTHOR_NAME", "Agent Tools"))
+
+	return strings.Join([]string{
+		fmt.Sprintf("git config user.email >/dev/null || git config user.email %s", email),
+		fmt.Sprintf("git config user.name >/dev/null || git config user.name %s", name),
+	}, " && ")
 }
 
 func (s *server) gitPull(w http.ResponseWriter, r *http.Request) {

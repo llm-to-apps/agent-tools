@@ -395,8 +395,6 @@ func TestGitSaveCommitsAndPushes(t *testing.T) {
 		t.Fatalf("create workdir: %v", err)
 	}
 	mustRun(t, workdir, "git", "init", "-b", "main")
-	mustRun(t, workdir, "git", "config", "user.email", "agent-tools@example.test")
-	mustRun(t, workdir, "git", "config", "user.name", "Agent Tools")
 	mustRun(t, workdir, "git", "remote", "add", "origin", remote)
 	if err := os.WriteFile(filepath.Join(workdir, "app.txt"), []byte("Saved\n"), 0644); err != nil {
 		t.Fatalf("write fixture: %v", err)
