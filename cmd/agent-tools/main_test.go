@@ -447,6 +447,7 @@ func TestSyncGitWorkspaceCreatesLocalBaselineWithoutPush(t *testing.T) {
 
 	t.Setenv("GIT_REPO_URL", remote)
 	t.Setenv("GIT_BRANCH", "main")
+	t.Setenv("GIT_PRESERVE_PATHS", "node_modules")
 	if err := syncGitWorkspace(workdir, filepath.Join(tmp, "sync.log"), 30*time.Second); err != nil {
 		t.Fatalf("sync git workspace: %v", err)
 	}
@@ -509,6 +510,7 @@ func TestSyncGitWorkspaceRestoresExistingRemoteBranch(t *testing.T) {
 
 	t.Setenv("GIT_REPO_URL", remote)
 	t.Setenv("GIT_BRANCH", "main")
+	t.Setenv("GIT_PRESERVE_PATHS", "node_modules")
 	if err := syncGitWorkspace(workdir, filepath.Join(tmp, "sync.log"), 30*time.Second); err != nil {
 		t.Fatalf("sync git workspace: %v", err)
 	}

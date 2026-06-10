@@ -79,6 +79,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	if restoreCommand := os.Getenv("APP_RESTORE_COMMAND"); restoreCommand != "" {
+		if err := runLoggedCommand(workdir, restoreCommand, logPath, envDurationSeconds("APP_RESTORE_TIMEOUT_SECONDS", 300)); err != nil {
+			log.Printf("restore command failed: %v", err)
+			os.Exit(1)
+		}
+	}
+
 	if startupCommands := os.Getenv("APP_STARTUP_COMMANDS"); startupCommands != "" {
 		if err := runLoggedCommand(workdir, startupCommands, logPath, envDurationSeconds("APP_STARTUP_TIMEOUT_SECONDS", 120)); err != nil {
 			log.Printf("startup command failed: %v", err)
@@ -860,6 +867,7 @@ func syncGitWorkspace(workdir, logPath string, timeout time.Duration) error {
 	}
 
 	branch := env("GIT_BRANCH", "main")
+	preservePaths := gitPreservePaths()
 	if err := os.MkdirAll(workdir, 0755); err != nil {
 		return err
 	}
@@ -877,7 +885,7 @@ func syncGitWorkspace(workdir, logPath string, timeout time.Duration) error {
 	}
 
 	return runLoggedCommand(workdir, strings.Join([]string{
-		fmt.Sprintf("if %s; then %s; else %s; fi", remoteBranchExistsCommand(repoURL, branch), restoreRemoteBranchCommand(repoURL, branch), localInitialCommitCommand(repoURL, branch)),
+		fmt.Sprintf("if %s; then %s; else %s; fi", remoteBranchExistsCommand(repoURL, branch), restoreRemoteBranchCommand(repoURL, branch, preservePaths), localInitialCommitCommand(repoURL, branch, preservePaths)),
 	}, " && "), logPath, timeout)
 }
 
@@ -889,39 +897,94 @@ func remoteBranchExistsCommand(repoURL, branch string) string {
 	)
 }
 
-func restoreRemoteBranchCommand(repoURL, branch string) string {
+func restoreRemoteBranchCommand(repoURL, branch string, preservePaths []string) string {
+	preserveCommands, restoreCommands := preservePathCommands(preservePaths)
+
 	return strings.Join([]string{
 		"tmp=\"$(mktemp -d)\"",
 		"preserve=\"$(mktemp -d)\"",
 		fmt.Sprintf("git clone --branch %s %s \"$tmp\"", shellQuote(branch), shellQuote(repoURL)),
-		"if [ -d node_modules ]; then mv node_modules \"$preserve/node_modules\"; fi",
+		preserveCommands,
 		"find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
 		"cp -a \"$tmp\"/. .",
-		"if [ -d \"$preserve/node_modules\" ] && [ ! -e node_modules ]; then mv \"$preserve/node_modules\" node_modules; fi",
+		restoreCommands,
 		"rm -rf \"$tmp\" \"$preserve\"",
 	}, " && ")
 }
 
-func localInitialCommitCommand(repoURL, branch string) string {
+func localInitialCommitCommand(repoURL, branch string, preservePaths []string) string {
 	return strings.Join([]string{
 		fmt.Sprintf("git init -b %s", shellQuote(branch)),
 		fmt.Sprintf("git remote add origin %s", shellQuote(repoURL)),
 		fmt.Sprintf("git config user.email %s", shellQuote(env("GIT_AUTHOR_EMAIL", "agent-tools@example.local"))),
 		fmt.Sprintf("git config user.name %s", shellQuote(env("GIT_AUTHOR_NAME", "Agent Tools"))),
-		initialImportAddCommand(),
+		initialImportAddCommand(preservePaths),
 		"git diff --cached --quiet || git commit -m 'Initial project import'",
 	}, " && ")
 }
 
-func initialImportAddCommand() string {
-	return strings.Join([]string{
-		"git add -A -- .",
-		"':!node_modules'",
-		"':!.next'",
-		"':!dist'",
-		"':!dist-worker'",
-		"':!*.log'",
-	}, " ")
+func initialImportAddCommand(preservePaths []string) string {
+	parts := []string{"git add -A -- ."}
+	for _, path := range preservePaths {
+		parts = append(parts, shellQuote(":!"+path))
+	}
+	return strings.Join(parts, " ")
+}
+
+func gitPreservePaths() []string {
+	raw := os.Getenv("GIT_PRESERVE_PATHS")
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	seen := map[string]bool{}
+	paths := []string{}
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ':' || r == ',' || r == '\n'
+	}) {
+		path, ok := cleanRelativePath(part)
+		if !ok || seen[path] {
+			continue
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func cleanRelativePath(path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" || filepath.IsAbs(path) {
+		return "", false
+	}
+
+	cleaned := filepath.ToSlash(filepath.Clean(path))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") {
+		return "", false
+	}
+
+	return cleaned, true
+}
+
+func preservePathCommands(paths []string) (string, string) {
+	if len(paths) == 0 {
+		return ":", ":"
+	}
+
+	preserve := make([]string, 0, len(paths))
+	restore := make([]string, 0, len(paths))
+	for index, path := range paths {
+		slot := fmt.Sprintf("$preserve/%d", index)
+		parent := filepath.ToSlash(filepath.Dir(path))
+		preserve = append(preserve, fmt.Sprintf("if [ -e %s ]; then mv %s %s; fi", shellQuote(path), shellQuote(path), slot))
+		if parent == "." {
+			restore = append(restore, fmt.Sprintf("if [ -e %s ] && [ ! -e %s ]; then mv %s %s; fi", slot, shellQuote(path), slot, shellQuote(path)))
+			continue
+		}
+		restore = append(restore, fmt.Sprintf("if [ -e %s ] && [ ! -e %s ]; then mkdir -p %s && mv %s %s; fi", slot, shellQuote(path), shellQuote(parent), slot, shellQuote(path)))
+	}
+	return strings.Join(preserve, " && "), strings.Join(restore, " && ")
 }
 
 func shellQuote(value string) string {
