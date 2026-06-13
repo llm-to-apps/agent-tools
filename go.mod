@@ -1,3 +1,3 @@
-module github.com/llm-to-apps/agent-tools
+module github.com/os7/agent-tools
 
 go 1.22

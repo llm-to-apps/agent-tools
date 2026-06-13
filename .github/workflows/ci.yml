@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/llm-to-apps/agent-tools
+  IMAGE_NAME: ghcr.io/os7/agent-tools
 
 jobs:
   test:

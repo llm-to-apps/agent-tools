@@ -1,6 +1,6 @@
 # agent-tools
 
-Lightweight tools runtime for llm-to-apps user instances.
+Lightweight tools runtime for os7 user instances.
 
 `agent-tools` runs inside an application container and exposes a small JSON API
 for coding agents:
