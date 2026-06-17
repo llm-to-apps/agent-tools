@@ -22,8 +22,12 @@ import (
 )
 
 type server struct {
-	workdir string
-	app     *appProcess
+	workdir          string
+	prodApp          *appProcess
+	devApp           *appProcess
+	activityMu       sync.Mutex
+	lastToolActivity time.Time
+	devIdleTimeout   time.Duration
 }
 
 type jsonError struct {
@@ -38,21 +42,37 @@ type commandResult struct {
 	Duration string `json:"duration"`
 }
 
+type runtimeSnapshot struct {
+	Mode      string `json:"mode"`
+	RuntimeID string `json:"runtimeId"`
+	Started   string `json:"started"`
+}
+
+type gitSyncResult struct {
+	Changed bool `json:"changed"`
+}
+
 type appProcess struct {
-	mu                sync.Mutex
-	command           string
-	workdir           string
-	logPath           string
-	cmd               *exec.Cmd
-	done              chan error
-	started           *time.Time
-	lastExit          *time.Time
-	lastExitError     string
-	restartCount      int
-	maxRestarts       int
-	restartBackoff    time.Duration
-	supervisorEnabled bool
-	stopping          bool
+	mu                 sync.Mutex
+	name               string
+	command            string
+	mode               string
+	buildCommand       string
+	buildTimeout       time.Duration
+	workdir            string
+	logPath            string
+	cmd                *exec.Cmd
+	done               chan error
+	started            *time.Time
+	runtimeID          string
+	lastExit           *time.Time
+	lastExitError      string
+	restartCount       int
+	maxRestarts        int
+	restartBackoff     time.Duration
+	supervisorEnabled  bool
+	stopping           bool
+	runtimeSubscribers map[chan runtimeSnapshot]struct{}
 }
 
 func main() {
@@ -63,11 +83,26 @@ func main() {
 	token := os.Getenv("AGENT_TOOLS_TOKEN")
 
 	s := &server{
-		workdir: workdir,
-		app: &appProcess{
-			command:           os.Getenv("APP_COMMAND"),
+		workdir:        workdir,
+		devIdleTimeout: envDurationSeconds("APP_DEV_IDLE_TIMEOUT_SECONDS", 60),
+		prodApp: &appProcess{
+			name:              "prod",
+			command:           firstNonEmpty(os.Getenv("APP_PROD_COMMAND"), os.Getenv("APP_COMMAND")),
+			mode:              "prod",
+			buildCommand:      os.Getenv("APP_BUILD_COMMAND"),
+			buildTimeout:      envDurationSeconds("APP_BUILD_TIMEOUT_SECONDS", 600),
 			workdir:           workdir,
-			logPath:           logPath,
+			logPath:           firstNonEmpty(os.Getenv("APP_PROD_LOG"), logPath),
+			maxRestarts:       envInt("APP_MAX_RESTARTS", 5),
+			restartBackoff:    envDurationSeconds("APP_RESTART_BACKOFF_SECONDS", 2),
+			supervisorEnabled: envBool("APP_AUTO_RESTART", true),
+		},
+		devApp: &appProcess{
+			name:              "dev",
+			command:           os.Getenv("APP_DEV_COMMAND"),
+			mode:              "dev",
+			workdir:           workdir,
+			logPath:           env("APP_DEV_LOG", "/tmp/agent-tools-dev.log"),
 			maxRestarts:       envInt("APP_MAX_RESTARTS", 5),
 			restartBackoff:    envDurationSeconds("APP_RESTART_BACKOFF_SECONDS", 2),
 			supervisorEnabled: envBool("APP_AUTO_RESTART", true),
@@ -77,7 +112,8 @@ func main() {
 	if os.Getenv("GIT_REPO_URL") != "" {
 		log.Printf("syncing git workspace")
 	}
-	if err := syncGitWorkspace(workdir, logPath, envDurationSeconds("GIT_SYNC_TIMEOUT_SECONDS", 120)); err != nil {
+	gitSync, err := syncGitWorkspace(workdir, logPath, envDurationSeconds("GIT_SYNC_TIMEOUT_SECONDS", 120))
+	if err != nil {
 		log.Printf("git workspace sync failed: %v", err)
 		os.Exit(1)
 	}
@@ -86,12 +122,16 @@ func main() {
 	}
 
 	if restoreCommand := os.Getenv("APP_RESTORE_COMMAND"); restoreCommand != "" {
-		log.Printf("running restore command: %s", restoreCommand)
-		if err := runLoggedCommand(workdir, restoreCommand, logPath, envDurationSeconds("APP_RESTORE_TIMEOUT_SECONDS", 300)); err != nil {
-			log.Printf("restore command failed: %v", err)
-			os.Exit(1)
+		if gitSync.Changed {
+			log.Printf("running restore command: %s", restoreCommand)
+			if err := runLoggedCommand(workdir, restoreCommand, logPath, envDurationSeconds("APP_RESTORE_TIMEOUT_SECONDS", 300)); err != nil {
+				log.Printf("restore command failed: %v", err)
+				os.Exit(1)
+			}
+			log.Printf("restore command completed")
+		} else {
+			log.Printf("skipping restore command: git workspace did not replace image files")
 		}
-		log.Printf("restore command completed")
 	}
 
 	if startupCommands := os.Getenv("APP_STARTUP_COMMANDS"); startupCommands != "" {
@@ -103,12 +143,25 @@ func main() {
 		log.Printf("startup commands completed")
 	}
 
-	if s.app.command != "" {
-		log.Printf("starting app command: %s", s.app.command)
-		if err := s.app.start(); err != nil {
+	if strings.TrimSpace(s.prodApp.buildCommand) != "" {
+		if gitSync.Changed {
+			log.Printf("running startup build: git workspace replaced image files")
+			if err := runLoggedCommand(workdir, s.prodApp.buildCommand, logPath, s.prodApp.buildTimeout); err != nil {
+				log.Printf("startup build failed: %v", err)
+				os.Exit(1)
+			}
+		} else {
+			log.Printf("skipping startup build: git workspace did not replace image files")
+		}
+	}
+
+	if s.prodApp.command != "" {
+		log.Printf("starting prod command: %s", s.prodApp.command)
+		if err := s.prodApp.start(); err != nil {
 			log.Printf("failed to start app command: %v", err)
 		}
 	}
+	s.startDevIdleWatcher(context.Background())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.health)
@@ -126,28 +179,40 @@ func main() {
 	mux.HandleFunc("POST /git/push", s.gitPush)
 	mux.HandleFunc("POST /git/sync", s.gitSync)
 	mux.HandleFunc("GET /git/remote", s.gitRemote)
-	mux.HandleFunc("POST /app/start", s.appStart)
-	mux.HandleFunc("POST /app/restart", s.appRestart)
+	mux.HandleFunc("POST /app/dev/start", s.appDevStart)
+	mux.HandleFunc("POST /app/dev/stop", s.appDevStop)
+	mux.HandleFunc("POST /app/prod/restart", s.appProdRestart)
+	mux.HandleFunc("POST /app/prod/stop", s.appProdStop)
+	mux.HandleFunc("POST /app/build", s.appBuild)
 	mux.HandleFunc("GET /app/status", s.appStatus)
 	mux.HandleFunc("GET /app/logs", s.appLogs)
+	mux.HandleFunc("GET /runtime/status", s.publicRuntimeStatus)
+	mux.HandleFunc("GET /runtime/events", s.publicRuntimeEvents)
 
 	addr := host + ":" + port
 	log.Printf("agent-tools listening on %s, workdir=%s", addr, workdir)
-	if err := http.ListenAndServe(addr, withJSON(withAuth(mux, token))); err != nil {
+	if err := http.ListenAndServe(addr, withJSON(withAuth(mux, token, s.markToolActivity))); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func withAuth(next http.Handler, token string) http.Handler {
-	if token == "" {
-		return next
-	}
+func withAuth(next http.Handler, token string, markActivity func()) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		headerToken := r.Header.Get("X-Agent-Tools-Token")
-		if auth != token && headerToken != token {
-			writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
+		if strings.HasPrefix(r.URL.Path, "/runtime/") {
+			next.ServeHTTP(w, r)
 			return
+		}
+
+		if token != "" {
+			auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			headerToken := r.Header.Get("X-Agent-Tools-Token")
+			if auth != token && headerToken != token {
+				writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
+				return
+			}
+		}
+		if markActivity != nil {
+			markActivity()
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -164,8 +229,66 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"workdir": s.workdir,
-		"app":     s.app.status(),
+		"prod":    s.prodApp.status(),
+		"dev":     s.devApp.status(),
 	})
+}
+
+func (s *server) markToolActivity() {
+	if s.devIdleTimeout <= 0 {
+		return
+	}
+
+	s.activityMu.Lock()
+	s.lastToolActivity = time.Now()
+	s.activityMu.Unlock()
+}
+
+func (s *server) startDevIdleWatcher(ctx context.Context) {
+	if s.devIdleTimeout <= 0 {
+		return
+	}
+
+	interval := s.devIdleTimeout / 4
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	if interval > 15*time.Second {
+		interval = 15 * time.Second
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				s.stopIdleDevServer(now)
+			}
+		}
+	}()
+}
+
+func (s *server) stopIdleDevServer(now time.Time) {
+	if s.devIdleTimeout <= 0 || !s.devApp.isRunning() {
+		return
+	}
+
+	s.activityMu.Lock()
+	lastActivity := s.lastToolActivity
+	s.activityMu.Unlock()
+
+	if lastActivity.IsZero() || now.Sub(lastActivity) < s.devIdleTimeout {
+		return
+	}
+
+	log.Printf("stopping dev process after %s without agent-tools activity", s.devIdleTimeout)
+	if err := s.devApp.stop(); err != nil {
+		log.Printf("failed to stop idle dev process: %v", err)
+	}
 }
 
 func (s *server) filesTree(w http.ResponseWriter, r *http.Request) {
@@ -540,42 +663,71 @@ func (s *server) gitPush(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) gitSync(w http.ResponseWriter, r *http.Request) {
-	if err := syncGitWorkspace(s.workdir, env("AGENT_APP_LOG", "/tmp/agent-tools-app.log"), envDurationSeconds("GIT_SYNC_TIMEOUT_SECONDS", 120)); err != nil {
+	result, err := syncGitWorkspace(s.workdir, env("AGENT_APP_LOG", "/tmp/agent-tools-app.log"), envDurationSeconds("GIT_SYNC_TIMEOUT_SECONDS", 120))
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "changed": result.Changed})
 }
 
-func (s *server) appStart(w http.ResponseWriter, r *http.Request) {
+func (s *server) appDevStart(w http.ResponseWriter, r *http.Request) {
+	s.markToolActivity()
+	if err := s.devApp.start(); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.devApp.status())
+}
+
+func (s *server) appDevStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.devApp.stop(); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.devApp.status())
+}
+
+func (s *server) appProdRestart(w http.ResponseWriter, r *http.Request) {
+	if err := s.prodApp.restart(); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.prodApp.status())
+}
+
+func (s *server) appProdStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.prodApp.stop(); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.prodApp.status())
+}
+
+func (s *server) appBuild(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Command string `json:"command"`
+		Command        string `json:"command"`
+		TimeoutSeconds int    `json:"timeoutSeconds"`
 	}
 	if err := readJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if strings.TrimSpace(req.Command) != "" {
-		s.app.setCommand(req.Command)
-	}
-	if err := s.app.start(); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, s.app.status())
-}
 
-func (s *server) appRestart(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.restart(); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
+	result := s.prodApp.build(req.Command, req.TimeoutSeconds)
+	status := http.StatusOK
+	if result.ExitCode != 0 {
+		status = http.StatusBadRequest
 	}
-	writeJSON(w, http.StatusOK, s.app.status())
+	writeJSON(w, status, result)
 }
 
 func (s *server) appStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.app.status())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"prod": s.prodApp.status(),
+		"dev":  s.devApp.status(),
+	})
 }
 
 func (s *server) appLogs(w http.ResponseWriter, r *http.Request) {
@@ -583,21 +735,61 @@ func (s *server) appLogs(w http.ResponseWriter, r *http.Request) {
 	if tail <= 0 || tail > 2000 {
 		tail = 200
 	}
-	lines, err := tailFile(s.app.logPath, tail)
+	app := s.prodApp
+	if r.URL.Query().Get("process") == "dev" {
+		app = s.devApp
+	}
+	lines, err := tailFile(app.logPath, tail)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path":  s.app.logPath,
+		"path":  app.logPath,
 		"lines": lines,
 	})
 }
 
-func (a *appProcess) setCommand(command string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.command = command
+func (s *server) publicRuntimeStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"runtime": s.prodApp.runtimeSnapshot(),
+	})
+}
+
+func (s *server) publicRuntimeEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming is not supported"))
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	events, unsubscribe := s.prodApp.subscribeRuntime()
+	defer unsubscribe()
+
+	writeRuntimeEvent(w, "runtime.current", s.prodApp.runtimeSnapshot())
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case snapshot := <-events:
+			writeRuntimeEvent(w, "runtime.changed", snapshot)
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keep-alive\n\n")
+			flusher.Flush()
+		}
+	}
 }
 
 func (a *appProcess) start() error {
@@ -635,12 +827,14 @@ func (a *appProcess) startLocked(autoRestart bool) error {
 	a.cmd = cmd
 	a.done = make(chan error, 1)
 	a.started = &now
+	a.runtimeID = newRuntimeID(now)
 	a.stopping = false
 	if !autoRestart {
 		a.restartCount = 0
 		a.lastExit = nil
 		a.lastExitError = ""
 	}
+	snapshot := a.runtimeSnapshotLocked()
 
 	go func() {
 		err := cmd.Wait()
@@ -648,6 +842,7 @@ func (a *appProcess) startLocked(autoRestart bool) error {
 		_ = logFile.Close()
 		a.handleExit(cmd, err)
 	}()
+	go a.publishRuntime(snapshot)
 
 	return nil
 }
@@ -669,16 +864,16 @@ func (a *appProcess) handleExit(cmd *exec.Cmd, err error) {
 	a.mu.Unlock()
 
 	if err != nil {
-		log.Printf("app process exited: %v", err)
+		log.Printf("%s process exited: %v", a.name, err)
 	} else {
-		log.Printf("app process exited")
+		log.Printf("%s process exited", a.name)
 	}
 
 	if !shouldRestart {
 		return
 	}
 
-	log.Printf("restarting app process, attempt %d/%d", a.restartCount, a.maxRestarts)
+	log.Printf("restarting %s process, attempt %d/%d", a.name, a.restartCount, a.maxRestarts)
 	time.Sleep(backoff)
 
 	a.mu.Lock()
@@ -692,6 +887,40 @@ func (a *appProcess) handleExit(cmd *exec.Cmd, err error) {
 }
 
 func (a *appProcess) restart() error {
+	if err := a.stop(); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.restartCount = 0
+	a.lastExit = nil
+	a.lastExitError = ""
+	return a.startLocked(false)
+}
+
+func (a *appProcess) build(command string, timeoutSeconds int) commandResult {
+	if strings.TrimSpace(command) == "" {
+		a.mu.Lock()
+		command = a.buildCommand
+		a.mu.Unlock()
+	}
+	if strings.TrimSpace(command) == "" {
+		return commandResult{
+			Command:  "",
+			ExitCode: 1,
+			Stderr:   "app build command is not configured",
+			Duration: "0s",
+		}
+	}
+
+	timeout := a.buildTimeout
+	if timeoutSeconds > 0 {
+		timeout = time.Duration(timeoutSeconds) * time.Second
+	}
+	return runLoggedCommandResult(a.workdir, command, a.logPath, timeout)
+}
+
+func (a *appProcess) stop() error {
 	a.mu.Lock()
 	cmd := a.cmd
 	done := a.done
@@ -713,13 +942,11 @@ func (a *appProcess) restart() error {
 			}
 		}
 	}
+
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.stopping = false
-	a.restartCount = 0
-	a.lastExit = nil
-	a.lastExitError = ""
-	return a.startLocked(false)
+	a.mu.Unlock()
+	return nil
 }
 
 func (a *appProcess) status() map[string]any {
@@ -742,7 +969,11 @@ func (a *appProcess) status() map[string]any {
 	return map[string]any{
 		"running":           running,
 		"pid":               pid,
+		"mode":              a.mode,
+		"name":              a.name,
+		"runtimeId":         a.runtimeID,
 		"command":           a.command,
+		"buildCommand":      a.buildCommand,
 		"started":           started,
 		"lastExit":          lastExit,
 		"lastExitError":     a.lastExitError,
@@ -751,6 +982,89 @@ func (a *appProcess) status() map[string]any {
 		"supervisorEnabled": a.supervisorEnabled,
 		"logPath":           a.logPath,
 	}
+}
+
+func (a *appProcess) isRunning() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.cmd != nil && a.cmd.Process != nil && a.cmd.ProcessState == nil
+}
+
+func (a *appProcess) runtimeSnapshot() runtimeSnapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.runtimeSnapshotLocked()
+}
+
+func (a *appProcess) runtimeSnapshotLocked() runtimeSnapshot {
+	started := ""
+	if a.started != nil {
+		started = a.started.Format(time.RFC3339)
+	}
+
+	return runtimeSnapshot{
+		Mode:      a.mode,
+		RuntimeID: a.runtimeID,
+		Started:   started,
+	}
+}
+
+func (a *appProcess) subscribeRuntime() (<-chan runtimeSnapshot, func()) {
+	ch := make(chan runtimeSnapshot, 8)
+
+	a.mu.Lock()
+	if a.runtimeSubscribers == nil {
+		a.runtimeSubscribers = make(map[chan runtimeSnapshot]struct{})
+	}
+	a.runtimeSubscribers[ch] = struct{}{}
+	a.mu.Unlock()
+
+	return ch, func() {
+		a.mu.Lock()
+		delete(a.runtimeSubscribers, ch)
+		close(ch)
+		a.mu.Unlock()
+	}
+}
+
+func (a *appProcess) publishRuntime(snapshot runtimeSnapshot) {
+	a.mu.Lock()
+	subscribers := make([]chan runtimeSnapshot, 0, len(a.runtimeSubscribers))
+	for subscriber := range a.runtimeSubscribers {
+		subscribers = append(subscribers, subscriber)
+	}
+	a.mu.Unlock()
+
+	for _, subscriber := range subscribers {
+		select {
+		case subscriber <- snapshot:
+		default:
+		}
+	}
+}
+
+func newRuntimeID(started time.Time) string {
+	return fmt.Sprintf("rt_%d", started.UnixNano())
+}
+
+func writeRuntimeEvent(w io.Writer, event string, snapshot runtimeSnapshot) {
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return
+	}
+
+	fmt.Fprintf(w, "event: %s\n", event)
+	fmt.Fprintf(w, "data: %s\n\n", payload)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (s *server) safePath(raw string) (string, error) {
@@ -882,20 +1196,88 @@ func runLoggedCommand(cwd, command, logPath string, timeout time.Duration) error
 	return err
 }
 
-func syncGitWorkspace(workdir, logPath string, timeout time.Duration) error {
+func runLoggedCommandResult(cwd, command, logPath string, timeout time.Duration) commandResult {
+	start := time.Now()
+	if strings.TrimSpace(command) == "" {
+		return commandResult{
+			Command:  command,
+			ExitCode: 0,
+			Duration: time.Since(start).String(),
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
+		return commandResult{
+			Command:  command,
+			ExitCode: 1,
+			Stderr:   err.Error(),
+			Duration: time.Since(start).String(),
+		}
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return commandResult{
+			Command:  command,
+			ExitCode: 1,
+			Stderr:   err.Error(),
+			Duration: time.Since(start).String(),
+		}
+	}
+	defer logFile.Close()
+
+	fmt.Fprintf(logFile, "\n$ %s\n", command)
+	log.Printf("running command in %s: %s", cwd, command)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-lc", command)
+	cmd.Dir = cwd
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = io.MultiWriter(logFile, os.Stdout, &stdout)
+	cmd.Stderr = io.MultiWriter(logFile, os.Stderr, &stderr)
+
+	err = cmd.Run()
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		stderr.WriteString("\ncommand timed out")
+		exitCode = 124
+	}
+	if exitCode == 0 {
+		log.Printf("command completed: %s", command)
+	}
+
+	return commandResult{
+		Command:  command,
+		ExitCode: exitCode,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		Duration: time.Since(start).String(),
+	}
+}
+
+func syncGitWorkspace(workdir, logPath string, timeout time.Duration) (gitSyncResult, error) {
 	repoURL := os.Getenv("GIT_REPO_URL")
 	if strings.TrimSpace(repoURL) == "" {
-		return nil
+		return gitSyncResult{}, nil
 	}
 
 	branch := env("GIT_BRANCH", "main")
 	preservePaths := gitPreservePaths()
 	if err := os.MkdirAll(workdir, 0755); err != nil {
-		return err
+		return gitSyncResult{}, err
 	}
 
 	gitDir := filepath.Join(workdir, ".git")
 	if _, err := os.Stat(gitDir); err == nil {
+		before := strings.TrimSpace(runCommand(workdir, "git", []string{"rev-parse", "HEAD"}, nil, "", 30*time.Second).Stdout)
 		commands := []string{
 			fmt.Sprintf("git remote get-url origin >/dev/null 2>&1 && git remote set-url origin %s || git remote add origin %s", shellQuote(repoURL), shellQuote(repoURL)),
 			fmt.Sprintf("git checkout %s 2>/dev/null || git checkout -b %s", shellQuote(branch), shellQuote(branch)),
@@ -903,12 +1285,24 @@ func syncGitWorkspace(workdir, logPath string, timeout time.Duration) error {
 			fmt.Sprintf("if %s; then git pull --ff-only origin %s; fi", remoteBranchExistsCommand(repoURL, branch), shellQuote(branch)),
 		}
 
-		return runLoggedCommand(workdir, strings.Join(commands, " && "), logPath, timeout)
+		if err := runLoggedCommand(workdir, strings.Join(commands, " && "), logPath, timeout); err != nil {
+			return gitSyncResult{}, err
+		}
+		after := strings.TrimSpace(runCommand(workdir, "git", []string{"rev-parse", "HEAD"}, nil, "", 30*time.Second).Stdout)
+		return gitSyncResult{Changed: before != "" && after != "" && before != after}, nil
 	}
 
-	return runLoggedCommand(workdir, strings.Join([]string{
-		fmt.Sprintf("if %s; then %s; else %s; fi", remoteBranchExistsCommand(repoURL, branch), restoreRemoteBranchCommand(repoURL, branch, preservePaths), localInitialCommitCommand(repoURL, branch, preservePaths)),
-	}, " && "), logPath, timeout)
+	remoteExists := runCommand(workdir, "sh", []string{"-lc", remoteBranchExistsCommand(repoURL, branch)}, nil, "", timeout)
+	command := localInitialCommitCommand(repoURL, branch, preservePaths)
+	changed := false
+	if remoteExists.ExitCode == 0 {
+		command = restoreRemoteBranchCommand(repoURL, branch, preservePaths)
+		changed = true
+	}
+	if err := runLoggedCommand(workdir, command, logPath, timeout); err != nil {
+		return gitSyncResult{}, err
+	}
+	return gitSyncResult{Changed: changed}, nil
 }
 
 func remoteBranchExistsCommand(repoURL, branch string) string {

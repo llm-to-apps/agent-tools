@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -242,7 +243,8 @@ func TestRunLoggedCommand(t *testing.T) {
 func TestAppStatus(t *testing.T) {
 	tmp := t.TempDir()
 	s := testServer(tmp)
-	s.app.setCommand("npm run dev")
+	s.prodApp.command = "npm run start"
+	s.devApp.command = "npm run dev"
 
 	req := httptest.NewRequest(http.MethodGet, "/app/status", nil)
 	rec := httptest.NewRecorder()
@@ -250,20 +252,130 @@ func TestAppStatus(t *testing.T) {
 	assertStatus(t, rec, http.StatusOK)
 
 	var resp struct {
-		Running bool   `json:"running"`
-		Command string `json:"command"`
-		LogPath string `json:"logPath"`
+		Prod struct {
+			Running bool   `json:"running"`
+			Command string `json:"command"`
+			LogPath string `json:"logPath"`
+		} `json:"prod"`
+		Dev struct {
+			Running bool   `json:"running"`
+			Command string `json:"command"`
+			LogPath string `json:"logPath"`
+		} `json:"dev"`
 	}
 	decode(t, rec, &resp)
 
-	if resp.Running {
-		t.Fatal("expected app to be stopped")
+	if resp.Prod.Running || resp.Dev.Running {
+		t.Fatal("expected app processes to be stopped")
 	}
-	if resp.Command != "npm run dev" {
-		t.Fatalf("unexpected app command: %q", resp.Command)
+	if resp.Prod.Command != "npm run start" || resp.Dev.Command != "npm run dev" {
+		t.Fatalf("unexpected app commands: %+v", resp)
 	}
-	if resp.LogPath == "" {
-		t.Fatal("expected log path")
+	if resp.Prod.LogPath == "" || resp.Dev.LogPath == "" {
+		t.Fatal("expected log paths")
+	}
+}
+
+func TestAppBuildRunsConfiguredBuildCommand(t *testing.T) {
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	s.prodApp.buildCommand = "printf built > build.txt"
+	s.prodApp.buildTimeout = 5 * time.Second
+
+	req := httptest.NewRequest(http.MethodPost, "/app/build", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	s.appBuild(rec, req)
+	assertStatus(t, rec, http.StatusOK)
+
+	var resp commandResult
+	decode(t, rec, &resp)
+	if resp.ExitCode != 0 {
+		t.Fatalf("expected build to pass: %+v", resp)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmp, "build.txt"))
+	if err != nil {
+		t.Fatalf("expected build output file: %v", err)
+	}
+	if string(data) != "built" {
+		t.Fatalf("unexpected build output: %q", string(data))
+	}
+}
+
+func TestAppDevStartDoesNotStopProd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("app supervisor uses sh")
+	}
+
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	s.prodApp.command = `printf prod > prod.txt; trap 'exit 0' TERM; while true; do sleep 1; done`
+	s.devApp.command = `printf dev > dev.txt; trap 'exit 0' TERM; while true; do sleep 1; done`
+	s.prodApp.supervisorEnabled = false
+	s.devApp.supervisorEnabled = false
+
+	if err := s.prodApp.start(); err != nil {
+		t.Fatalf("prod start returned error: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(tmp, "prod.txt"))
+		return err == nil && string(data) == "prod"
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/app/dev/start", nil)
+	rec := httptest.NewRecorder()
+	s.appDevStart(rec, req)
+	assertStatus(t, rec, http.StatusOK)
+
+	var resp map[string]any
+	decode(t, rec, &resp)
+
+	waitFor(t, 2*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(tmp, "dev.txt"))
+		return err == nil && string(data) == "dev"
+	})
+	if !s.prodApp.status()["running"].(bool) {
+		t.Fatal("expected prod to keep running while dev starts")
+	}
+
+	if err := s.devApp.stop(); err != nil {
+		t.Fatalf("dev stop returned error: %v", err)
+	}
+	if err := s.prodApp.stop(); err != nil {
+		t.Fatalf("prod stop returned error: %v", err)
+	}
+}
+
+func TestDevIdleWatcherStopsDevAfterToolInactivity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("app supervisor uses sh")
+	}
+
+	tmp := t.TempDir()
+	s := testServer(tmp)
+	s.devIdleTimeout = 50 * time.Millisecond
+	s.devApp.command = `printf dev > dev.txt; trap 'exit 0' TERM; while true; do sleep 1; done`
+	s.devApp.supervisorEnabled = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.markToolActivity()
+	if err := s.devApp.start(); err != nil {
+		t.Fatalf("dev start returned error: %v", err)
+	}
+	s.startDevIdleWatcher(ctx)
+
+	waitFor(t, 2*time.Second, func() bool {
+		return !s.devApp.status()["running"].(bool)
+	})
+
+	status := s.devApp.status()
+	if status["running"].(bool) {
+		t.Fatal("expected idle dev process to stop")
+	}
+	if status["restartCount"].(int) != 0 {
+		t.Fatalf("idle stop should not consume restart attempts: %+v", status)
 	}
 }
 
@@ -306,10 +418,13 @@ func TestAppAutoRestartStopsAfterMaxAttempts(t *testing.T) {
 }
 
 func TestAuthMiddleware(t *testing.T) {
+	activityCount := 0
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
-	handler := withJSON(withAuth(next, "secret"))
+	handler := withJSON(withAuth(next, "secret", func() {
+		activityCount++
+	}))
 
 	noAuthReq := httptest.NewRequest(http.MethodGet, "/health", nil)
 	noAuthRec := httptest.NewRecorder()
@@ -321,6 +436,17 @@ func TestAuthMiddleware(t *testing.T) {
 	authRec := httptest.NewRecorder()
 	handler.ServeHTTP(authRec, authReq)
 	assertStatus(t, authRec, http.StatusOK)
+	if activityCount != 1 {
+		t.Fatalf("expected authenticated tool request to mark activity once, got %d", activityCount)
+	}
+
+	runtimeReq := httptest.NewRequest(http.MethodGet, "/runtime/status", nil)
+	runtimeRec := httptest.NewRecorder()
+	handler.ServeHTTP(runtimeRec, runtimeReq)
+	assertStatus(t, runtimeRec, http.StatusOK)
+	if activityCount != 1 {
+		t.Fatalf("runtime requests must not keep dev alive, got activity count %d", activityCount)
+	}
 }
 
 func TestGitStatusInRepository(t *testing.T) {
@@ -451,8 +577,12 @@ func TestSyncGitWorkspaceCreatesLocalBaselineWithoutPush(t *testing.T) {
 	t.Setenv("GIT_REPO_URL", remote)
 	t.Setenv("GIT_BRANCH", "main")
 	t.Setenv("GIT_PRESERVE_PATHS", "node_modules")
-	if err := syncGitWorkspace(workdir, filepath.Join(tmp, "sync.log"), 30*time.Second); err != nil {
+	result, err := syncGitWorkspace(workdir, filepath.Join(tmp, "sync.log"), 30*time.Second)
+	if err != nil {
 		t.Fatalf("sync git workspace: %v", err)
+	}
+	if result.Changed {
+		t.Fatal("expected initial local baseline to keep image artifacts reusable")
 	}
 
 	refs := strings.TrimSpace(mustRunOutput(t, tmp, "git", "--git-dir", remote, "for-each-ref", "--format=%(refname)"))
@@ -514,8 +644,12 @@ func TestSyncGitWorkspaceRestoresExistingRemoteBranch(t *testing.T) {
 	t.Setenv("GIT_REPO_URL", remote)
 	t.Setenv("GIT_BRANCH", "main")
 	t.Setenv("GIT_PRESERVE_PATHS", "node_modules")
-	if err := syncGitWorkspace(workdir, filepath.Join(tmp, "sync.log"), 30*time.Second); err != nil {
+	result, err := syncGitWorkspace(workdir, filepath.Join(tmp, "sync.log"), 30*time.Second)
+	if err != nil {
 		t.Fatalf("sync git workspace: %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("expected restoring an existing remote branch to require fresh restore/build")
 	}
 
 	data, err := os.ReadFile(filepath.Join(workdir, "app.txt"))
@@ -536,9 +670,17 @@ func TestSyncGitWorkspaceRestoresExistingRemoteBranch(t *testing.T) {
 func testServer(workdir string) *server {
 	return &server{
 		workdir: workdir,
-		app: &appProcess{
+		prodApp: &appProcess{
+			name:    "prod",
+			mode:    "prod",
 			workdir: workdir,
-			logPath: filepath.Join(workdir, "app.log"),
+			logPath: filepath.Join(workdir, "prod.log"),
+		},
+		devApp: &appProcess{
+			name:    "dev",
+			mode:    "dev",
+			workdir: workdir,
+			logPath: filepath.Join(workdir, "dev.log"),
 		},
 	}
 }
